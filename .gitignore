@@ -3,3 +3,6 @@ dist/
 .env
 *.log
 .DS_Store
+Readycode.app/Contents/MacOS/readycode
+Readycode.app/Contents/_CodeSignature/
+logs/
