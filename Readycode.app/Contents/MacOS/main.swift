@@ -1,14 +1,75 @@
 import SwiftUI
 import Foundation
 import Darwin
+import WebKit
+
+// MARK: - Auto-Responses
+// Pattern → response table for interactive prompts CC throws at us.
+// Each entry: a substring to match in the raw PTY output, and what to send back.
+// Checked in order — first match wins. Grow this list as we discover new prompts.
+
+struct AutoResponse {
+    let name: String           // human-readable label for logging
+    let pattern: String        // substring to match in raw output (ANSI-stripped)
+    let response: String       // what to write back to the PTY
+    let delay: TimeInterval    // seconds to wait before responding (lets CC settle)
+}
+
+let autoResponses: [AutoResponse] = [
+    AutoResponse(
+        name: "trust-folder",
+        pattern: "trust this folder",
+        response: "\r",          // Enter key to confirm the default selection
+        delay: 0.5
+    ),
+    // Add new patterns here as we discover them:
+    // AutoResponse(
+    //     name: "example-prompt",
+    //     pattern: "some text CC shows",
+    //     response: "our answer\r",
+    //     delay: 0.5
+    // ),
+]
 
 // MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        setupMainMenu()
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         // PTY cleanup happens via AppState.stop()
+    }
+
+    func setupMainMenu() {
+        let mainMenu = NSMenu()
+
+        // App menu
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "About Readycode", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "Quit Readycode", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        // Edit menu (enables copy/paste/select all)
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        NSApp.mainMenu = mainMenu
     }
 }
 
@@ -17,8 +78,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 @Observable
 class AppState {
     // Setup
-    var workingFolder: String = ""
-    var taskText: String = ""
+    var workingFolder: String = "/Users/minibot/projects/readycode-project1"
+    var taskText: String = "List all files in this repository and give a one-line description of each."
     var taskFilePath: String = ""
     var useTaskFile: Bool = false
     var additionalInstructions: String = ""
@@ -30,6 +91,16 @@ class AppState {
     var elapsedSeconds: Int = 0
     var blockedQuestion: String? = nil
     var blockedAnswer: String = ""
+
+    // Orchestration state
+    var thinkerResponding = false       // true once thinker starts its first spinner (past echo)
+    var implementerResponding = false   // true once implementer starts working
+    var implementerOutputBuffer = ""    // accumulates implementer response text
+    var lastImplementerActivity = Date()  // for idle detection
+
+    // Terminal WebView coordinators (feed raw PTY output to xterm.js)
+    var thinkerTerminalCoordinator = TerminalWebViewCoordinator()
+    var implementerTerminalCoordinator = TerminalWebViewCoordinator()
 
     // Sessions
     var thinkerSession: PTYSession?
@@ -82,12 +153,18 @@ class AppState {
         thinkerSession?.onOutput = { [weak self] text in
             self?.handleThinkerOutput(text)
         }
+        thinkerSession?.onAutoResponse = { [weak self] name, _ in
+            self?.addLog(.system, "Auto-responded to '\(name)' (thinker)")
+        }
         thinkerSession?.spawn()
 
         addLog(.system, "Starting implementer session...")
         implementerSession = PTYSession(label: "implementer", workingDirectory: workingFolder, logger: diskLogger)
         implementerSession?.onOutput = { [weak self] text in
             self?.handleImplementerOutput(text)
+        }
+        implementerSession?.onAutoResponse = { [weak self] name, _ in
+            self?.addLog(.system, "Auto-responded to '\(name)' (implementer)")
         }
         implementerSession?.spawn()
 
@@ -157,21 +234,27 @@ class AppState {
         var prompt = """
         You are the THINKER in a two-agent system called readycode. Your job is to plan and coordinate long-running work on a codebase.
 
-        IMPORTANT: Your first response must be a numbered todo list of all the steps needed to complete this task. Format each item as:
-        TODO: 1. [description]
-        TODO: 2. [description]
-        etc.
+        IMPORTANT RESPONSE FORMAT:
 
-        After the todo list, output the first implementation prompt, wrapped in these markers:
+        1. First, output a numbered todo list. Each line must start with exactly "TODO: " followed by the number:
+        TODO: 1. First step description
+        TODO: 2. Second step description
+
+        2. Then output the first implementation prompt between these exact markers (on their own lines):
         <<<IMPL_PROMPT>>>
-        [your prompt for the implementer]
+        (your detailed prompt for the implementer goes here)
         <<<END_IMPL_PROMPT>>>
 
-        When you receive results back, evaluate progress and either:
-        - Output DONE: [n] to mark todo item n as complete
-        - Output the next <<<IMPL_PROMPT>>>...<<<END_IMPL_PROMPT>>> block
-        - Output BLOCKED: [question] if you need human input
-        - Output ALL_COMPLETE when everything is done
+        3. When you receive results back from the implementer, respond with:
+        - DONE: [n] to mark todo item n as complete
+        - Another <<<IMPL_PROMPT>>>...<<<END_IMPL_PROMPT>>> block for the next task
+        - BLOCKED: [question] if you need human input
+        - ALL_COMPLETE when everything is done
+
+        RULES:
+        - The implementer is a separate Claude Code session. It can read files, write files, run commands.
+        - Give the implementer clear, specific, self-contained prompts. It has no memory of previous prompts.
+        - Do NOT write code yourself. Just tell the implementer what to do.
 
         THE TASK:
         \(task)
@@ -182,7 +265,20 @@ class AppState {
         }
 
         addLog(.thinker, "Sending initial prompt with task")
+        thinkerResponding = false
         thinkerSession?.write(prompt + "\n")
+        // CC's TUI needs a separate Enter to submit after a paste
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.thinkerSession?.write("\r")
+        }
+    }
+
+    func stripAnsi(_ text: String) -> String {
+        let esc = "\u{1B}"
+        return text.replacingOccurrences(of: "\(esc)\\[[0-9;]*[a-zA-Z]", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\(esc)\\].*?\u{07}", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\(esc)[^\\[\\]]", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\u{07}", with: "")
     }
 
     func handleThinkerOutput(_ text: String) {
@@ -192,18 +288,38 @@ class AppState {
             // Log raw output
             self.diskLogger?.log(source: "thinker", text: text)
 
-            // Parse for our markers
-            let lines = text.components(separatedBy: "\n")
+            // Feed raw output to xterm.js terminal
+            self.thinkerTerminalCoordinator.writeToTerminal(text)
+
+            let stripped = self.stripAnsi(text)
+
+            // Detect when thinker starts responding (spinner = past the echo)
+            let spinnerChars: Set<Character> = ["✻", "✳", "✶", "✢", "✽", "·", "⏺"]
+            if !self.thinkerResponding {
+                for ch in stripped {
+                    if spinnerChars.contains(ch) {
+                        self.thinkerResponding = true
+                        self.addLog(.system, "Thinker is responding...")
+                        break
+                    }
+                }
+            }
+
+            // Only parse markers AFTER the thinker has started responding
+            // (this skips the echoed prompt which contains our example markers)
+            guard self.thinkerResponding else { return }
+
+            let lines = stripped.components(separatedBy: "\n")
             for line in lines {
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
 
                 // Todo items
                 if trimmed.hasPrefix("TODO:") {
                     let item = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-                    // Strip leading number + dot
                     let cleaned = item.replacingOccurrences(of: #"^\d+\.\s*"#, with: "", options: .regularExpression)
-                    if !cleaned.isEmpty {
+                    if !cleaned.isEmpty && !self.todoItems.contains(where: { $0.title == cleaned }) {
                         self.todoItems.append(TodoItem(title: cleaned))
+                        self.addLog(.system, "Todo: \(cleaned)")
                     }
                 }
 
@@ -236,15 +352,22 @@ class AppState {
                 }
             }
 
-            // Check for implementation prompt
-            if text.contains("<<<IMPL_PROMPT>>>"), text.contains("<<<END_IMPL_PROMPT>>>") {
-                if let range = text.range(of: "<<<IMPL_PROMPT>>>"),
-                   let endRange = text.range(of: "<<<END_IMPL_PROMPT>>>") {
-                    let prompt = String(text[range.upperBound..<endRange.lowerBound])
+            // Check for implementation prompt — use the ANSI-stripped text
+            // The thinker wraps prompts in <<<IMPL_PROMPT>>>...<<<END_IMPL_PROMPT>>>
+            if stripped.contains("<<<IMPL_PROMPT>>>") && stripped.contains("<<<END_IMPL_PROMPT>>>") {
+                if let range = stripped.range(of: "<<<IMPL_PROMPT>>>"),
+                   let endRange = stripped.range(of: "<<<END_IMPL_PROMPT>>>") {
+                    let prompt = String(stripped[range.upperBound..<endRange.lowerBound])
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                     if !prompt.isEmpty && self.runState == .running {
-                        self.addLog(.system, "Sending prompt to implementer (\(prompt.count) chars)")
+                        self.addLog(.system, "Sending to implementer (\(prompt.count) chars): \(String(prompt.prefix(100)))...")
+                        self.implementerResponding = false
+                        self.implementerOutputBuffer = ""
                         self.implementerSession?.write(prompt + "\n")
+                        // Submit after paste settles
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                            self?.implementerSession?.write("\r")
+                        }
                     }
                 }
             }
@@ -264,16 +387,77 @@ class AppState {
             // Log raw output
             self.diskLogger?.log(source: "implementer", text: text)
 
+            // Feed raw output to xterm.js terminal
+            self.implementerTerminalCoordinator.writeToTerminal(text)
+
+            let stripped = self.stripAnsi(text)
+
+            // Detect when implementer starts working (spinner)
+            let spinnerChars: Set<Character> = ["✻", "✳", "✶", "✢", "✽", "·", "⏺"]
+            if !self.implementerResponding {
+                for ch in stripped {
+                    if spinnerChars.contains(ch) {
+                        self.implementerResponding = true
+                        self.addLog(.system, "Implementer is working...")
+                        break
+                    }
+                }
+            }
+
+            // Accumulate output for feeding back to thinker
+            if self.implementerResponding {
+                self.implementerOutputBuffer += stripped
+                // Cap buffer
+                if self.implementerOutputBuffer.count > 50_000 {
+                    self.implementerOutputBuffer = String(self.implementerOutputBuffer.suffix(40_000))
+                }
+                self.lastImplementerActivity = Date()
+            }
+
+            // Idle detection: look for the ❯ prompt after implementer has been responding
+            // This means CC finished and is waiting for the next input
+            if self.implementerResponding && stripped.contains("❯") {
+                // Debounce — wait 3 seconds of quiet to confirm idle
+                let checkTime = Date()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                    guard let self,
+                          self.implementerResponding,
+                          self.runState == .running,
+                          self.lastImplementerActivity <= checkTime else { return }
+
+                    // Implementer is idle — feed results back to thinker
+                    self.implementerResponding = false
+                    self.addLog(.system, "Implementer idle — sending results to thinker")
+
+                    // Summarize the implementer's output (take last 4KB to stay within context)
+                    let result = String(self.implementerOutputBuffer.suffix(4000))
+                    let feedback = """
+                    The implementer has completed the task. Here is its output (last 4KB):
+
+                    ---
+                    \(result)
+                    ---
+
+                    Based on this output, decide what to do next:
+                    - Mark completed items with DONE: [n]
+                    - Send the next task with <<<IMPL_PROMPT>>>...<<<END_IMPL_PROMPT>>>
+                    - Or output ALL_COMPLETE if everything is done.
+                    """
+
+                    self.thinkerResponding = false  // reset so we skip the echo again
+                    self.thinkerSession?.write(feedback + "\n")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        self?.thinkerSession?.write("\r")
+                    }
+                    self.implementerOutputBuffer = ""
+                }
+            }
+
             // Add summarized entry to visible log
             let summary = self.summarizeOutput(text, maxLength: 200)
             if !summary.isEmpty {
                 self.addLog(.implementer, summary)
             }
-
-            // TODO: Idle detection — this is the big unknown.
-            // For now we need to learn what CC's output looks like when it's done.
-            // The raw disk logs will help us figure this out.
-            // Once we know the pattern, we feed results back to the thinker here.
         }
     }
 
@@ -290,7 +474,10 @@ class AppState {
 
     func summarizeOutput(_ text: String, maxLength: Int) -> String {
         // Strip ANSI escape codes
-        let stripped = text.replacingOccurrences(of: #"\x1B\[[0-9;]*[a-zA-Z]"#, with: "", options: .regularExpression)
+        let esc = "\u{1B}"
+        let stripped = text.replacingOccurrences(of: "\(esc)\\[[0-9;]*[a-zA-Z]", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\(esc)\\].*?\u{07}", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\(esc)[^\\[\\]]", with: "", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if stripped.isEmpty { return "" }
         if stripped.count <= maxLength { return stripped }
@@ -393,7 +580,9 @@ class PTYSession {
     var childPID: pid_t = 0
     var readSource: DispatchSourceRead?
     var onOutput: ((String) -> Void)?
+    var onAutoResponse: ((String, String) -> Void)?  // (name, response) for logging
     var buffer = Data()
+    var recentOutput: String = ""  // rolling window for pattern matching
 
     init(label: String, workingDirectory: String, logger: DiskLogger?) {
         self.label = label
@@ -414,6 +603,10 @@ class PTYSession {
             setenv("TERM", "xterm-256color", 1)
             setenv("COLUMNS", "120", 1)
             setenv("LINES", "50", 1)
+
+            // Clear CC's nesting detection so it doesn't refuse to launch
+            unsetenv("CLAUDECODE")
+            unsetenv("CLAUDE_CODE_SESSION")
 
             // Find claude binary
             let possiblePaths = [
@@ -458,6 +651,7 @@ class PTYSession {
                 let data = Data(buf[..<n])
                 if let text = String(data: data, encoding: .utf8) {
                     self.onOutput?(text)
+                    self.checkAutoResponses(text)
                 }
             } else if n <= 0 {
                 source.cancel()
@@ -472,6 +666,40 @@ class PTYSession {
         }
         source.resume()
         readSource = source
+    }
+
+    func checkAutoResponses(_ text: String) {
+        // Strip ANSI escape codes — \u{1B} is ESC in Swift strings
+        let esc = "\u{1B}"
+        let stripped = text.replacingOccurrences(of: "\(esc)\\[[0-9;]*[a-zA-Z]", with: " ", options: .regularExpression)
+            .replacingOccurrences(of: "\(esc)\\].*?\u{07}", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\(esc)[^\\[\\]]", with: "", options: .regularExpression)
+
+        // Debug: log what we see after stripping
+        let preview = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !preview.isEmpty {
+            logger?.log(source: "\(label)-stripped", text: preview)
+        }
+
+        // Append to rolling window (keep last 2KB for matching across chunks)
+        recentOutput += stripped
+        if recentOutput.count > 2048 {
+            recentOutput = String(recentOutput.suffix(1024))
+        }
+
+        for ar in autoResponses {
+            if recentOutput.contains(ar.pattern) {
+                // Clear the match so we don't fire again
+                recentOutput = ""
+                logger?.log(source: "\(label)-auto", text: "Matched '\(ar.name)' — sending response after \(ar.delay)s")
+                onAutoResponse?(ar.name, ar.response)
+
+                DispatchQueue.global().asyncAfter(deadline: .now() + ar.delay) { [weak self] in
+                    self?.write(ar.response)
+                }
+                break  // one match per chunk
+            }
+        }
     }
 
     func write(_ text: String) {
@@ -548,7 +776,7 @@ struct ContentView: View {
                     ProgressPanel()
                 }
                 .frame(minWidth: 320, idealWidth: 380)
-                LogPanel()
+                RightPanel()
                     .frame(minWidth: 400)
             }
         }
@@ -643,6 +871,7 @@ struct SetupPanel: View {
                     panel.canChooseDirectories = true
                     panel.canChooseFiles = false
                     panel.allowsMultipleSelection = false
+                    panel.canCreateDirectories = true
                     if panel.runModal() == .OK, let url = panel.url {
                         state.workingFolder = url.path
                     }
@@ -790,6 +1019,184 @@ struct ProgressPanel: View {
     }
 }
 
+enum RightTab: String, CaseIterable {
+    case log = "Log"
+    case thinker = "Thinker"
+    case implementer = "Implementer"
+}
+
+struct RightPanel: View {
+    @State private var selectedTab: RightTab = .log
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Tab bar
+            HStack(spacing: 0) {
+                ForEach(RightTab.allCases, id: \.self) { tab in
+                    Button(tab.rawValue) {
+                        selectedTab = tab
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(selectedTab == tab ? Color.accentColor.opacity(0.2) : Color.clear)
+                    .cornerRadius(6)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            Divider()
+
+            switch selectedTab {
+            case .log:
+                LogPanel()
+            case .thinker:
+                TerminalView(source: .thinker)
+            case .implementer:
+                TerminalView(source: .implementer)
+            }
+        }
+    }
+}
+
+// MARK: - xterm.js Terminal View
+
+let xtermHTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #1e1e1e; }
+  #terminal { height: 100%; }
+</style>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+</head>
+<body>
+<div id="terminal"></div>
+<script>
+  const term = new window.Terminal({
+    fontSize: 14,
+    fontFamily: 'Menlo, Monaco, monospace',
+    theme: { background: '#1e1e1e', foreground: '#d4d4d4' },
+    scrollback: 10000,
+    convertEol: false,
+    cursorBlink: false,
+    disableStdin: true
+  });
+  const fitAddon = new window.FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(document.getElementById('terminal'));
+  fitAddon.fit();
+
+  window.addEventListener('resize', () => fitAddon.fit());
+  new ResizeObserver(() => fitAddon.fit()).observe(document.getElementById('terminal'));
+
+  // Called from Swift to write data
+  function writeData(base64) {
+    const bytes = atob(base64);
+    term.write(bytes);
+  }
+
+  function clearTerminal() {
+    term.clear();
+  }
+</script>
+</body>
+</html>
+"""
+
+class TerminalWebViewCoordinator {
+    var webView: WKWebView?
+    var pendingChunks: [String] = []
+    var isReady = false
+
+    func writeToTerminal(_ rawText: String) {
+        // Base64 encode to safely pass through JS
+        guard let data = rawText.data(using: .utf8) else { return }
+        let b64 = data.base64EncodedString()
+        let js = "writeData('\(b64)');"
+
+        if isReady, let wv = webView {
+            wv.evaluateJavaScript(js, completionHandler: nil)
+        } else {
+            pendingChunks.append(js)
+        }
+    }
+
+    func flush() {
+        guard isReady, let wv = webView else { return }
+        for js in pendingChunks {
+            wv.evaluateJavaScript(js, completionHandler: nil)
+        }
+        pendingChunks.removeAll()
+    }
+}
+
+struct TerminalWebViewRepresentable: NSViewRepresentable {
+    let coordinator: TerminalWebViewCoordinator
+
+    func makeNSView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
+        let wv = WKWebView(frame: .zero, configuration: config)
+        wv.navigationDelegate = context.coordinator
+        coordinator.webView = wv
+        wv.loadHTMLString(xtermHTML, baseURL: nil)
+        return wv
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {}
+
+    func makeCoordinator() -> NavDelegate {
+        NavDelegate(terminal: coordinator)
+    }
+
+    class NavDelegate: NSObject, WKNavigationDelegate {
+        let terminal: TerminalWebViewCoordinator
+        init(terminal: TerminalWebViewCoordinator) { self.terminal = terminal }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            terminal.isReady = true
+            terminal.flush()
+        }
+    }
+}
+
+struct TerminalView: View {
+    @Environment(AppState.self) var state
+    let source: LogSource
+
+    var coordinator: TerminalWebViewCoordinator {
+        switch source {
+        case .thinker: return state.thinkerTerminalCoordinator
+        case .implementer: return state.implementerTerminalCoordinator
+        default: return state.thinkerTerminalCoordinator
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Spacer()
+                Button("Clear") {
+                    coordinator.webView?.evaluateJavaScript("clearTerminal();", completionHandler: nil)
+                }
+                .font(.system(size: 12))
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+
+            TerminalWebViewRepresentable(coordinator: coordinator)
+        }
+    }
+}
+
 struct LogPanel: View {
     @Environment(AppState.self) var state
     @State private var filter: LogSource? = nil
@@ -868,8 +1275,8 @@ struct LogEntryRow: View {
                 .frame(width: 55, alignment: .leading)
             Text(entry.message)
                 .foregroundStyle(.primary)
-                .textSelection(.enabled)
         }
+        .textSelection(.enabled)
     }
 }
 
