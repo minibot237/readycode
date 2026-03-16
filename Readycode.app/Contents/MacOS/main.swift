@@ -94,6 +94,7 @@ class AppState {
 
     // Orchestration state
     var thinkerResponding = false       // true once thinker starts its first spinner (past echo)
+    var thinkerResponseBuffer = ""      // accumulates ONLY thinker response chunks (post-spinner)
     var implementerResponding = false   // true once implementer starts working
     var implementerOutputBuffer = ""    // accumulates implementer response text
     var lastImplementerActivity = Date()  // for idle detection
@@ -294,88 +295,104 @@ class AppState {
             let stripped = self.stripAnsi(text)
 
             // Detect when thinker starts responding (spinner = past the echo)
-            let spinnerChars: Set<Character> = ["✻", "✳", "✶", "✢", "✽", "·", "⏺"]
+            // IMPORTANT: when we first see the spinner, skip this entire chunk
+            // because it contains the echoed prompt mixed with the spinner start.
+            // Only start parsing from the NEXT chunk.
+            let spinnerChars: Set<Character> = ["✻", "✳", "✶", "✢", "✽", "·"]
             if !self.thinkerResponding {
                 for ch in stripped {
                     if spinnerChars.contains(ch) {
                         self.thinkerResponding = true
+                        self.thinkerResponseBuffer = ""
                         self.addLog(.system, "Thinker is responding...")
                         break
                     }
                 }
+                // Skip this chunk entirely — it has the echo
+                return
             }
 
-            // Only parse markers AFTER the thinker has started responding
-            // (this skips the echoed prompt which contains our example markers)
-            guard self.thinkerResponding else { return }
-
-            let lines = stripped.components(separatedBy: "\n")
-            for line in lines {
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-
-                // Todo items
-                if trimmed.hasPrefix("TODO:") {
-                    let item = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-                    let cleaned = item.replacingOccurrences(of: #"^\d+\.\s*"#, with: "", options: .regularExpression)
-                    if !cleaned.isEmpty && !self.todoItems.contains(where: { $0.title == cleaned }) {
-                        self.todoItems.append(TodoItem(title: cleaned))
-                        self.addLog(.system, "Todo: \(cleaned)")
-                    }
-                }
-
-                // Done markers
-                if trimmed.hasPrefix("DONE:") {
-                    let numStr = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-                    if let num = Int(numStr), num > 0, num <= self.todoItems.count {
-                        self.todoItems[num - 1].isComplete = true
-                        self.addLog(.system, "Completed: \(self.todoItems[num - 1].title)")
-                    }
-                }
-
-                // Blocked
-                if trimmed.hasPrefix("BLOCKED:") {
-                    let question = String(trimmed.dropFirst(8)).trimmingCharacters(in: .whitespaces)
-                    self.blockedQuestion = question
-                    self.runState = .blocked
-                    self.addLog(.system, "BLOCKED: \(question)")
-                    self.sendTelegramNotification("🚨 Readycode blocked: \(question)")
-                }
-
-                // All complete
-                if trimmed == "ALL_COMPLETE" {
-                    self.runState = .complete
-                    self.addLog(.system, "All tasks complete!")
-                    let runtime = self.formatElapsed(self.elapsedSeconds)
-                    let done = self.todoItems.filter(\.isComplete).count
-                    let total = self.todoItems.count
-                    self.sendTelegramNotification("✅ Readycode complete! \(done)/\(total) tasks in \(runtime)")
-                }
+            // Accumulate response text (only chunks AFTER the echo)
+            self.thinkerResponseBuffer += stripped
+            // Cap buffer
+            if self.thinkerResponseBuffer.count > 100_000 {
+                self.thinkerResponseBuffer = String(self.thinkerResponseBuffer.suffix(80_000))
             }
 
-            // Check for implementation prompt — use the ANSI-stripped text
-            // The thinker wraps prompts in <<<IMPL_PROMPT>>>...<<<END_IMPL_PROMPT>>>
-            if stripped.contains("<<<IMPL_PROMPT>>>") && stripped.contains("<<<END_IMPL_PROMPT>>>") {
-                if let range = stripped.range(of: "<<<IMPL_PROMPT>>>"),
-                   let endRange = stripped.range(of: "<<<END_IMPL_PROMPT>>>") {
-                    let prompt = String(stripped[range.upperBound..<endRange.lowerBound])
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !prompt.isEmpty && self.runState == .running {
-                        self.addLog(.system, "Sending to implementer (\(prompt.count) chars): \(String(prompt.prefix(100)))...")
-                        self.implementerResponding = false
-                        self.implementerOutputBuffer = ""
-                        self.implementerSession?.write(prompt + "\n")
-                        // Submit after paste settles
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                            self?.implementerSession?.write("\r")
-                        }
-                    }
-                }
-            }
+            // Parse the accumulated buffer for markers
+            self.parseThinkerBuffer()
 
             // Add summarized entry to visible log
             let summary = self.summarizeOutput(text, maxLength: 200)
             if !summary.isEmpty {
                 self.addLog(.thinker, summary)
+            }
+        }
+    }
+
+    func parseThinkerBuffer() {
+        let buf = thinkerResponseBuffer
+
+        // Parse TODO items
+        let lines = buf.components(separatedBy: "\n")
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if trimmed.hasPrefix("TODO:") {
+                let item = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                let cleaned = item.replacingOccurrences(of: #"^\d+\.\s*"#, with: "", options: .regularExpression)
+                if !cleaned.isEmpty && !self.todoItems.contains(where: { $0.title == cleaned }) {
+                    self.todoItems.append(TodoItem(title: cleaned))
+                    self.addLog(.system, "Todo: \(cleaned)")
+                }
+            }
+
+            if trimmed.hasPrefix("DONE:") {
+                let numStr = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                if let num = Int(numStr), num > 0, num <= self.todoItems.count, !self.todoItems[num - 1].isComplete {
+                    self.todoItems[num - 1].isComplete = true
+                    self.addLog(.system, "Completed: \(self.todoItems[num - 1].title)")
+                }
+            }
+
+            if trimmed.hasPrefix("BLOCKED:") {
+                let question = String(trimmed.dropFirst(8)).trimmingCharacters(in: .whitespaces)
+                if self.runState != .blocked {
+                    self.blockedQuestion = question
+                    self.runState = .blocked
+                    self.addLog(.system, "BLOCKED: \(question)")
+                    self.sendTelegramNotification("🚨 Readycode blocked: \(question)")
+                }
+            }
+
+            if trimmed == "ALL_COMPLETE" && self.runState != .complete {
+                self.runState = .complete
+                self.addLog(.system, "All tasks complete!")
+                let runtime = self.formatElapsed(self.elapsedSeconds)
+                let done = self.todoItems.filter(\.isComplete).count
+                let total = self.todoItems.count
+                self.sendTelegramNotification("✅ Readycode complete! \(done)/\(total) tasks in \(runtime)")
+            }
+        }
+
+        // Check for implementation prompt in the buffer
+        if buf.contains("<<<IMPL_PROMPT>>>") && buf.contains("<<<END_IMPL_PROMPT>>>") {
+            if let range = buf.range(of: "<<<IMPL_PROMPT>>>"),
+               let endRange = buf.range(of: "<<<END_IMPL_PROMPT>>>"),
+               range.upperBound < endRange.lowerBound {
+                let prompt = String(buf[range.upperBound..<endRange.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !prompt.isEmpty && self.runState == .running {
+                    self.addLog(.system, "Sending to implementer (\(prompt.count) chars): \(String(prompt.prefix(100)))...")
+                    self.implementerResponding = false
+                    self.implementerOutputBuffer = ""
+                    self.implementerSession?.write(prompt + "\n")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        self?.implementerSession?.write("\r")
+                    }
+                    // Clear buffer up to end marker so we don't re-send
+                    self.thinkerResponseBuffer = String(buf[endRange.upperBound...])
+                }
             }
         }
     }
@@ -776,7 +793,7 @@ struct ContentView: View {
                     ProgressPanel()
                 }
                 .frame(minWidth: 320, idealWidth: 380)
-                RightPanel()
+                LogPanel()
                     .frame(minWidth: 400)
             }
         }
@@ -813,6 +830,29 @@ struct ControlBar: View {
             }
 
             Spacer()
+
+            // Terminal windows
+            Button("Thinker") {
+                TerminalWindowManager.shared.showWindow(
+                    title: "Thinker",
+                    coordinator: state.thinkerTerminalCoordinator
+                )
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+
+            Button("Implementer") {
+                TerminalWindowManager.shared.showWindow(
+                    title: "Implementer",
+                    coordinator: state.implementerTerminalCoordinator
+                )
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+
+            Divider()
+                .frame(height: 24)
+                .padding(.horizontal, 4)
 
             // Controls
             switch state.runState {
@@ -1019,44 +1059,74 @@ struct ProgressPanel: View {
     }
 }
 
-enum RightTab: String, CaseIterable {
-    case log = "Log"
-    case thinker = "Thinker"
-    case implementer = "Implementer"
+// MARK: - Terminal Window Manager
+
+class TerminalWindowManager {
+    static let shared = TerminalWindowManager()
+    private var windows: [String: NSWindow] = [:]
+    private var webViews: [String: WKWebView] = [:]
+
+    func showWindow(title: String, coordinator: TerminalWebViewCoordinator) {
+        // If window already exists, just bring it forward
+        if let existing = windows[title], existing.isVisible {
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        // Create WKWebView for this terminal
+        let config = WKWebViewConfiguration()
+        config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
+        let webView = WKWebView(frame: .zero, configuration: config)
+        let navDelegate = TerminalNavDelegate(coordinator: coordinator)
+        webView.navigationDelegate = navDelegate
+        // Hold a strong ref to the delegate
+        objc_setAssociatedObject(webView, "navDelegate", navDelegate, .OBJC_ASSOCIATION_RETAIN)
+
+        // Point coordinator at this webview
+        coordinator.webView = webView
+        coordinator.isReady = false
+
+        webView.loadHTMLString(xtermHTML, baseURL: nil)
+
+        // Create window
+        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 800, height: 600)
+        let windowWidth: CGFloat = 700
+        let windowHeight: CGFloat = 500
+
+        // Position: thinker top-right, implementer bottom-right
+        let x: CGFloat
+        let y: CGFloat
+        if title == "Thinker" {
+            x = screenFrame.maxX - windowWidth - 20
+            y = screenFrame.maxY - windowHeight - 20
+        } else {
+            x = screenFrame.maxX - windowWidth - 20
+            y = screenFrame.minY + 20
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: x, y: y, width: windowWidth, height: windowHeight),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Readycode — \(title)"
+        window.contentView = webView
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+
+        windows[title] = window
+        webViews[title] = webView
+    }
 }
 
-struct RightPanel: View {
-    @State private var selectedTab: RightTab = .log
+class TerminalNavDelegate: NSObject, WKNavigationDelegate {
+    let coordinator: TerminalWebViewCoordinator
+    init(coordinator: TerminalWebViewCoordinator) { self.coordinator = coordinator }
 
-    var body: some View {
-        VStack(spacing: 0) {
-            // Tab bar
-            HStack(spacing: 0) {
-                ForEach(RightTab.allCases, id: \.self) { tab in
-                    Button(tab.rawValue) {
-                        selectedTab = tab
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(selectedTab == tab ? Color.accentColor.opacity(0.2) : Color.clear)
-                    .cornerRadius(6)
-                }
-                Spacer()
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            Divider()
-
-            switch selectedTab {
-            case .log:
-                LogPanel()
-            case .thinker:
-                TerminalView(source: .thinker)
-            case .implementer:
-                TerminalView(source: .implementer)
-            }
-        }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        coordinator.isReady = true
+        coordinator.flush()
     }
 }
 
