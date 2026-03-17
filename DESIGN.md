@@ -82,9 +82,75 @@ Walks the step files in order:
 }
 ```
 
-4. **Advance or revise.** If `complete`, move to the next step. If `revise`, the reviewer writes revision notes and readycode sends the implementer another pass. If `blocked`, pause and notify the user.
+4. **Sign-off and commit.** If `complete`, the reviewer:
+   - Writes a journal entry to `.readycode/journal.md`
+   - Readycode commits all changes: `git add -A && git commit`
+   - Readycode tags the commit: `git tag step-01.3`
+   - Step file moves to `.readycode/completed/`
+   - Advance to the next step
 
-5. **Repeat** until all steps are done.
+5. **Revise or block.** If `revise`, the reviewer writes revision notes and readycode sends the implementer another pass — no commit, work stays dirty. If `blocked`, pause and notify the user via Telegram.
+
+6. **Repeat** until all steps are done.
+
+### The Journal
+
+A running log of completed work, written by the reviewer after each step:
+
+```markdown
+// .readycode/journal.md
+
+## Step 1.1: Bundle Structure (complete, 2:34)
+Created PreciousMetals.app with Info.plist, build.sh.
+Build succeeds. Binary is 148KB.
+
+## Step 1.2: Metal Model (complete, 1:12)
+Added Metal enum with Au/Ag/Pt/Pd. PriceData struct with bid/ask/change.
+Note: used @Observable instead of ObservableObject — requires macOS 14+.
+
+## Step 1.3: Widget Grid (complete, 4:47)
+2x2 grid working. Adjusted spacing — 300px too tight for 4-digit
+platinum prices, bumped to 320px.
+Decision: monospaced digits for prices to prevent layout jitter.
+
+## Step 1.4: App Menu (revise → complete, 1:03 + 0:45)
+First pass missed the Edit menu. Revision added it. Cmd+C works.
+```
+
+The journal serves every audience:
+- **Reviewer** reads it for continuity ("we decided monospaced digits in 1.3")
+- **Planner** reads it if replanning is needed ("steps 1.1–1.4 done, adjust phase 2")
+- **Fresh sessions** read it as a handoff — chronological, decision-rich
+- **You** read it in the morning to see exactly what happened overnight
+
+### Git as the Safety Net
+
+Every step completion is a **commit + tag**. The repo becomes a rewindable timeline:
+
+```
+git log --oneline
+a3f2c1d (tag: step-01.4) Step 1.4: App menu with edit shortcuts
+b7e9a0c (tag: step-01.3) Step 1.3: Widget grid 2x2 layout
+e1d4f8b (tag: step-01.2) Step 1.2: Metal model and price data
+f9c2b1a (tag: step-01.1) Step 1.1: App bundle structure
+d0a8e3f (tag: plan-complete) Planning complete: 23 steps across 5 phases
+```
+
+**The plan itself is committed** before any code runs. You can review it, edit step files, then start execution.
+
+**Rewind is clean.** Something went wrong at step 3.2?
+1. `git reset --hard step-03.1` — back to last good state
+2. Delete or edit the bad step file
+3. Hit Start — readycode picks up from the first uncompleted step
+
+**Interrupt and resume.** Stop the run at any time (or it crashes):
+1. Repo is at the last tagged step
+2. Journal tells you what happened
+3. Step files tell you what's remaining
+4. Edit upcoming steps if you want, add new ones, delete bad ones
+5. Start again — readycode resumes from where it left off
+
+**Only passing work gets committed.** The reviewer is the gatekeeper. If it says `revise`, no commit — the implementer tries again on dirty state. The tag only lands when the reviewer signs off.
 
 ### 3. Context Management
 
@@ -123,6 +189,7 @@ CC sessions have finite context windows. readycode manages this:
 ```
 .readycode/
   header.md                    # project context, sent with every planner/reviewer call
+  journal.md                   # running log of completed work (reviewer writes entries)
   config.json                  # telegram bot token, preferences
 
   plan/                        # output of the planning pipeline
@@ -145,7 +212,7 @@ CC sessions have finite context windows. readycode manages this:
       implementer.log
       system.log
 
-  completed/                   # finished step files (moved here after completion)
+  completed/                   # signed-off step files (moved here after commit + tag)
     step-01.1-bundle.md
     step-01.2-model.md
 ```
