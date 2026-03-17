@@ -1,151 +1,253 @@
 # readycode
 
-A native Mac app that drives two Claude Code sessions through long-running, multi-step work — while you sleep.
+A native Mac app that decomposes large coding tasks and executes them through Claude Code — while you sleep.
 
 ## The Problem
 
-Claude Code is great at executing well-scoped tasks in a single conversation. But real work — documenting an entire codebase, implementing a feature across many files, refactoring a module — takes many sequential steps where each step depends on what you learned in the last one.
+Claude Code is brilliant within a single context window. But real work — building an app from a spec, documenting an entire codebase, implementing a feature that touches 30 files — is bigger than one session. The work needs to be broken into CC-sized pieces, sequenced, executed, and verified.
 
-Today you do this manually: run Claude Code, read the output, figure out the next prompt, paste it in, repeat. readycode automates that loop.
+Today you do this manually: figure out the next chunk, write the prompt, run CC, check the result, repeat. readycode automates the whole pipeline — from planning through execution.
+
+## Core Insight
+
+**Files are the coordination layer.** CC sessions communicate through the filesystem, not through terminal parsing. The planner writes step files. The supervisor reads them and dispatches to the implementer. Results are fed back as files. Any session can pick up where the last left off because the state is on disk.
 
 ## How It Works
 
-Two Claude Code terminal sessions, one supervisor app:
+Three concerns, file-driven coordination:
 
-- **Thinker** — a Claude Code session that sees the high-level goal, progress so far, and results from the last implementation step. It decides what to do next and formulates the next implementation prompt.
-- **Implementer** — a Claude Code session pointed at the target codebase. It receives prompts from the thinker and does the actual file reading, writing, testing, and committing.
-- **readycode** — a native macOS app that hosts both sessions as PTYs, reads their output streams, detects when each is idle/waiting for input, and writes prompts into them. It orchestrates the handoff between thinker and implementer.
+### 1. Planning Pipeline (before any code runs)
 
-The loop:
-1. User provides a high-level goal ("document this codebase", "implement auth from this spec")
-2. readycode prompts the thinker with the goal — thinker generates a todo list (the full plan) as its first action
-3. readycode captures the todo list and displays it as the progress tracker
-4. Thinker outputs the first implementation prompt
-5. readycode writes that prompt into the implementer's terminal
-6. Implementer (Claude Code) executes — reads files, writes code, runs tests
-7. readycode captures the implementer's output, writes a summary/status back to the thinker
-8. Thinker evaluates progress, marks todo items complete, decides next step, outputs the next prompt
-9. Repeat until the thinker declares done, or escalates to the user
+Turns a big goal into CC-sized work units through progressive decomposition:
+
+**Pass 1 — Phase Decomposition.** A planner session reads the full project specs/goals and breaks the work into major phases. Each phase becomes a file:
+
+```
+.readycode/plan/
+  phase-01-app-shell.md
+  phase-02-live-data.md
+  phase-03-charts.md
+  ...
+```
+
+**Pass 2 — Step Decomposition.** The planner (same or fresh session) reads all phases + original specs and breaks each phase into implementable steps:
+
+```
+.readycode/plan/
+  step-01.1-bundle-structure.md
+  step-01.2-metal-model.md
+  step-01.3-widget-grid.md
+  step-02.1-price-service.md
+  ...
+```
+
+**Pass 3 — Validation.** Walk each step and ask: "Can a single CC session with fresh context execute this completely?" If not, split it further. Repeat until every step passes.
+
+The result: an ordered sequence of step files, each one a self-contained prompt that CC can execute in one go.
+
+**Adaptive complexity.** Simple tasks ("fix this bug", "add a README") might produce 1–3 steps total. The planner should recognize simple work and skip the multi-pass decomposition. A "document this codebase" might need 40 steps. The pipeline adapts to the scope.
+
+Each step file has a standard format:
+```markdown
+# Step 1.3: Widget Grid View
+> Build the 2x2 metal card layout with bid/ask/change display
+
+[detailed implementation prompt for the implementer]
+
+## Acceptance Criteria
+- [ ] Four metal cards in a grid
+- [ ] Bid price large and colored
+- [ ] Click to select
+```
+
+The first line is the title (readycode displays it in the progress panel). The blockquote is the summary (shows in logs). The body is the implementation prompt. Acceptance criteria tell the reviewer what to check.
+
+### 2. Execution Engine
+
+Walks the step files in order:
+
+1. **Pre-flight (Reviewer).** Readycode sends the reviewer: header context + the step file + current repo state. The reviewer can adjust the prompt if something from a previous step changes the approach, or approve it as-is. Writes `.readycode/dispatch/current-step.md` with the final prompt.
+
+2. **Implementation.** Readycode sends the dispatch file content to the implementer (persistent CC PTY session). Implementer executes — reads files, writes code, runs tests.
+
+3. **Post-flight (Reviewer).** Readycode feeds the implementer's output summary back to the reviewer. Reviewer checks against acceptance criteria and writes a status file:
+
+```json
+// .readycode/dispatch/status.json
+{
+  "step": "step-01.3-widget-grid.md",
+  "result": "complete",       // complete | revise | blocked
+  "notes": "All criteria met. Build succeeds.",
+  "next": "step-01.4-app-menu.md"
+}
+```
+
+4. **Advance or revise.** If `complete`, move to the next step. If `revise`, the reviewer writes revision notes and readycode sends the implementer another pass. If `blocked`, pause and notify the user.
+
+5. **Repeat** until all steps are done.
+
+### 3. Context Management
+
+CC sessions have finite context windows. readycode manages this:
+
+**Header file.** A persistent context file (`.readycode/header.md`) sent with every planner/reviewer call. Contains: project description, conventions, what's been built so far. Updated by the reviewer after each phase completes.
+
+**Planner continuity.** The planner writes all its output as files. If context gets heavy during planning, it writes a handoff file (`.readycode/plan/handoff.md`) summarizing decisions made, and readycode starts a fresh planner session that reads the handoff + all step files generated so far.
+
+**Reviewer continuity.** The reviewer is a persistent PTY session that builds context over time. It knows what happened in previous steps because it was there. When it feels context is getting heavy, it tells readycode — writes a handoff and gets a fresh session. The instruction is explicit: "If your context feels full, write a handoff file and tell me you need a fresh session."
+
+**Implementer isolation.** Each step gets the implementer in a reasonably clean state. For long runs, readycode may restart the implementer PTY between phases (not between steps within a phase) to keep context fresh.
+
+## The Three Roles
+
+### Planner
+- **When:** Before execution starts
+- **Job:** Decompose the goal into CC-sized step files
+- **Session:** Can be multiple sequential `-p` calls or a PTY session. Doesn't need to be persistent across the whole run — its output is files.
+- **Context needs:** Reads project specs, existing code structure. Writes step files.
+
+### Reviewer
+- **When:** Between steps during execution
+- **Job:** Pre-flight prompt adjustment, post-flight quality check, decide next action
+- **Session:** Persistent PTY (Claude Code). Builds up project understanding over time.
+- **Context needs:** Accumulates — knows what happened in previous steps. Manages its own context via handoff files when full.
+
+### Implementer
+- **When:** During step execution
+- **Job:** Execute the implementation prompt — read files, write code, run commands, test
+- **Session:** Persistent PTY (Claude Code) with bypass permissions. This is the session that does real work.
+- **Context needs:** Per-step. Gets the dispatch prompt and works within a single step's scope.
+
+## File Structure
+
+```
+.readycode/
+  header.md                    # project context, sent with every planner/reviewer call
+  config.json                  # telegram bot token, preferences
+
+  plan/                        # output of the planning pipeline
+    phase-01-app-shell.md
+    phase-02-live-data.md
+    step-01.1-bundle.md
+    step-01.2-model.md
+    step-01.3-grid.md
+    ...
+    handoff.md                 # planner context handoff (if needed)
+
+  dispatch/                    # current execution state
+    current-step.md            # the active implementation prompt
+    status.json                # reviewer's verdict on last step
+
+  logs/                        # per-run timestamped logs
+    2026-03-16_20-13-10/
+      planner.log
+      reviewer.log
+      implementer.log
+      system.log
+
+  completed/                   # finished step files (moved here after completion)
+    step-01.1-bundle.md
+    step-01.2-model.md
+```
 
 ## UI
 
 ### Main Window
 
-The app has a dashboard-style UI with these areas:
-
 **Setup Panel (top)**
-- **Working folder** — file picker or text field for the target codebase path
-- **Task** — either a file path to an instructions file, or a text field for direct entry. If entered directly, readycode writes it to a file so there's always a persistent task definition
-- **Additional instructions** — free-form text field for extra context, constraints, or style notes that get injected into the thinker's prompt
+- **Working folder** — file picker for the target codebase
+- **Task** — file path to specs/instructions, or direct text entry (saved to file)
+- **Additional instructions** — extra context injected into the planner's prompt
 
 **Progress Panel (center)**
-- **Todo list** — the plan generated by the thinker at the start of the run, displayed as a checklist. Items get checked off as the thinker reports them complete. This is the at-a-glance view of how far along the run is.
-- **Run time** — elapsed time since the run started, displayed prominently
-- **Progress bar** — derived from todo completion (e.g., "7/23 tasks complete")
+- **Step list** — all steps from the plan, displayed as a checklist. Current step highlighted. Completed steps checked off. Grouped by phase.
+- **Current step** — the title and summary of what's being executed right now
+- **Run time** — elapsed time, prominently displayed
+- **Progress** — "Step 7/23 · Phase 2/5"
 
-**Log Panel (bottom)**
-- **Running log** — live-scrolling view of what's happening. Shows which session is active (thinker/implementer), what's being sent, summarized output. Not raw PTY bytes — a human-readable narrative of the run.
-- Filterable by session (thinker only, implementer only, both)
+**Log Panel (right)**
+- **Running log** — human-readable narrative. Step headers from the step files, reviewer verdicts, implementer activity summaries.
+- Filterable: All / Planner / Reviewer / Implementer / System
 
-**Status / Control Bar**
-- **Run state** — Running, Paused, Blocked, Complete
-- **Pause/Resume button** — pauses the loop after the current step finishes
-- **Blocked indicator** — when the thinker encounters something it can't resolve, readycode pauses and displays the question prominently. The user can answer in-app or via Telegram.
+**Control Bar**
+- Run state: Planning → Running → Paused → Blocked → Complete
+- Start / Pause / Resume / Stop
+- Thinker and Implementer buttons open xterm.js terminal windows
+
+### Terminal Windows
+
+Separate floating windows for reviewer and implementer PTYs:
+- xterm.js in WKWebView for proper terminal rendering
+- Positioned top-right (reviewer) and bottom-right (implementer)
+- See the raw CC interaction in real-time
 
 ### Notifications (Telegram)
 
-readycode can reach out via Telegram when it needs attention:
-
-- **Blocked** — the thinker hit a showstopper and needs human input. Message includes the question and context. User can reply in Telegram and readycode feeds the answer back in.
-- **Complete** — the run finished. Message includes a summary: how many tasks done, run time, any warnings.
-- **Error** — something went wrong (CC crashed, context limit hit, etc.)
-
-This means you can kick off a run, go to bed, and get a Telegram message in the morning saying it's done — or a question at 2am if it got stuck (which you can answer from your phone or ignore until morning).
+- **Blocked** — reviewer can't proceed, needs human input
+- **Phase complete** — milestone notification with summary
+- **All complete** — final notification with stats
+- **Error** — CC crashed, context limit, build failure
 
 ## Architecture
 
 ### Native Mac App (Swift)
 
-readycode is a macOS application, not a CLI tool. Reasons:
+- Single-file Swift, `swiftc` compilation, same pattern as Minibot.app
+- SwiftUI dashboard + NSWindow management
+- WKWebView + xterm.js for terminal windows
+- PTY hosting via `forkpty` for reviewer and implementer sessions
+- File watching (DispatchSource or polling) for step/status files
+- Timer-based orchestration loop
 
-- **TCC permissions** — the app gets its own permission grants (Full Disk Access, etc.), isolated from the user's shell. Same pattern as Minibot.app.
-- **PTY hosting** — the app spawns two pseudo-terminals via `forkpty`/`posix_openpt`, runs `claude` in each. Full read/write access to both streams.
-- **Background operation** — runs unattended overnight. macOS app lifecycle keeps it alive, shows status in the dashboard window.
-- **Logging** — everything that flows through both PTYs gets logged to disk, timestamped. This is critical for debugging and understanding CC's output patterns.
+### Auto-Responses
 
-### Terminal I/O
+A pattern-matching table for interactive prompts CC throws:
+- Trust folder → Enter
+- Install LSP plugin → Enter
+- Growing list as we discover new prompts
 
-Each Claude Code session runs inside a PTY managed by readycode. The app:
+### Permissions
 
-- **Reads** the full output stream from each session (ANSI codes, tool output, everything)
-- **Writes** prompts and responses into each session's stdin
-- **Logs** all I/O to timestamped log files for post-hoc analysis
-
-### Idle Detection
-
-The key technical challenge: knowing when Claude Code has finished its current task and is waiting for input. This needs to be learned empirically.
-
-Approach:
-- Log everything, study the patterns
-- Look for the input prompt marker (whatever CC prints when it's ready for the next message)
-- May need to handle edge cases: permission prompts, error states, context limit warnings
-- Start simple, iterate based on what the logs tell us
-
-### Permissions / YOLO Mode
-
-Both Claude Code sessions run with permissions bypassed:
-- Default new sessions to bypass permissions (CC's built-in setting)
-- No interactive approval prompts to block the loop
-- The target codebase should be a git repo so everything is reversible
+- Implementer runs with `--dangerously-skip-permissions`
+- Reviewer runs with `--dangerously-skip-permissions`
+- Target codebase should be a git repo (everything reversible)
+- App has its own TCC grants (Full Disk Access)
 
 ### Logging
 
-readycode logs aggressively — every byte from both PTYs, timestamped. This serves two purposes:
-1. **Debugging** — when something goes wrong at 3am, the logs tell the story
-2. **Pattern learning** — we need to understand CC's output format to build reliable idle detection, question detection, and output parsing
-
-The dashboard log panel shows a processed, human-readable version. The raw logs go to disk for deep analysis.
-
-### Telegram Integration
-
-Uses the same Telegram transport pattern as minibot. Bot token + chat ID, simple message send for notifications, webhook or polling for replies when blocked. The blocked-question flow:
-
-1. Thinker says "I'm stuck, need to know X"
-2. readycode pauses the loop, sends Telegram message with the question
-3. User replies in Telegram (or in-app)
-4. readycode feeds the answer to the thinker, resumes the loop
+Every PTY byte logged to disk, timestamped. Step headers logged to the system log. Reviewer verdicts logged. The log panel shows the human-readable version. Raw logs are for debugging.
 
 ## Key Design Decisions
 
-**Why two CC sessions instead of one?**
-Context efficiency. The implementer burns context on file contents, diffs, and tool use. The thinker stays lean — it sees summaries and results, not raw file contents. This lets the thinking stay coherent across many more steps than a single session could handle.
+**Why files instead of terminal parsing?**
+We tried parsing markers from CC's TUI output. It doesn't work reliably — the terminal renders text with ANSI codes, cursor movements, line wrapping, and screen redraws that mangle structured markers. Files are clean, reliable, and inspectable. CC writes files naturally.
 
-**Why not use the Claude API for the thinker?**
-Both sessions are Claude Code. Same interface, same tool access, same capabilities. The thinker could use CC's tools to peek at files, check git status, etc. No API keys to manage, no separate billing, no different behavior to reason about.
+**Why progressive decomposition instead of one-shot planning?**
+A single planning pass tends to either over-plan (50 micro-steps for a 3-step task) or under-plan (3 vague phases for complex work). Progressive decomposition adapts: simple tasks skip to execution fast, complex tasks get properly broken down. The validation pass catches steps that are still too big.
 
-**Why a Mac app and not a CLI?**
-TCC permissions, proper app lifecycle for long-running background work, and a real UI for monitoring progress. CLI tools don't get their own TCC grants.
+**Why a persistent reviewer instead of stateless checks?**
+The reviewer needs to know what happened in previous steps. "The implementer created a stub PriceService in step 2.1" matters when reviewing step 2.2 which fills it in. A persistent session builds this understanding naturally. Handoff files handle the case where context gets full.
 
-**Why generate the todo list first?**
-It gives the user and readycode a shared progress tracker before any work starts. You can eyeball the plan, abort if it's off base, and then watch items tick off overnight. Without it, you'd have no idea how far along a run is.
+**Why separate planner and reviewer roles?**
+The planner runs before execution and may need multiple passes with fresh context. The reviewer runs during execution and benefits from continuity. Different lifecycle, different context needs.
 
-**When does it stop?**
-The thinker decides. It can: continue to the next step, pause and ask the user for input (triggering the blocked state + Telegram), or declare the work complete. There's a step budget to prevent runaway loops.
+**Why restart implementer between phases but not steps?**
+Steps within a phase are related — the implementer benefits from knowing it just created file X when asked to modify file X in the next step. But between phases, the context from phase 1 is noise when executing phase 3. A fresh session keeps the implementer focused.
 
 ## What It's Good For
 
-- "Document every module in this codebase" — systematic, repetitive, benefits from consistent approach
-- "Implement this feature spec" — multi-file changes where each step informs the next
-- "Refactor X to use Y" — find all instances, change them one by one, verify each works
-- "Review and fix all TODO comments" — scan, prioritize, address sequentially
-- Long tasks you'd kick off before bed and review in the morning
+- "Build this app from these specs" — the planning pipeline shines here
+- "Document every module in this codebase" — systematic, many small steps
+- "Implement this feature across the codebase" — multi-file, multi-step
+- "Refactor X to use Y everywhere" — repetitive with verification
+- Any work you'd kick off before bed and review in the morning
 
 ## What It's Not
 
 - Not a CI/CD tool — it runs on your Mac, on your code
-- Not an autonomous agent with internet access — it operates on local repos
-- Not a replacement for Claude Code — it's a supervisor for Claude Code
+- Not a replacement for Claude Code — it's a supervisor that gets more out of CC
+- Not fully autonomous — it can ask for help via Telegram when stuck
 
 ## Status
 
-Design phase. This document is the first artifact.
+Working prototype. PTY management, xterm.js terminals, auto-responses, basic orchestration loop proven. Rebuilding orchestration layer around file-based coordination and the planning pipeline.
