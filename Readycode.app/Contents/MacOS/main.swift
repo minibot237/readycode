@@ -93,20 +93,16 @@ class AppState {
     var blockedAnswer: String = ""
 
     // Orchestration state
-    var thinkerEchoDone = false          // true once the echo + prompt display is fully done
-    var thinkerResponding = false       // true once thinker starts its first spinner (past echo)
-    var thinkerResponseBuffer = ""      // accumulates ONLY thinker response chunks (post-spinner)
-    var thinkerChunkCount = 0           // count chunks after spinner to skip echo tail
     var implementerResponding = false   // true once implementer starts working
     var implementerOutputBuffer = ""    // accumulates implementer response text
     var lastImplementerActivity = Date()  // for idle detection
+    var thinkerBusy = false             // true while thinker -p call is running
 
     // Terminal WebView coordinators (feed raw PTY output to xterm.js)
     var thinkerTerminalCoordinator = TerminalWebViewCoordinator()
     var implementerTerminalCoordinator = TerminalWebViewCoordinator()
 
-    // Sessions
-    var thinkerSession: PTYSession?
+    // Sessions — thinker uses -p mode (Process), implementer uses PTY
     var implementerSession: PTYSession?
 
     // Logging
@@ -150,17 +146,7 @@ class AppState {
             self.elapsedSeconds = Int(Date().timeIntervalSince(start))
         }
 
-        // Spawn sessions
-        addLog(.system, "Starting thinker session...")
-        thinkerSession = PTYSession(label: "thinker", workingDirectory: workingFolder, logger: diskLogger)
-        thinkerSession?.onOutput = { [weak self] text in
-            self?.handleThinkerOutput(text)
-        }
-        thinkerSession?.onAutoResponse = { [weak self] name, _ in
-            self?.addLog(.system, "Auto-responded to '\(name)' (thinker)")
-        }
-        thinkerSession?.spawn()
-
+        // Spawn implementer (PTY — interactive, needs tools)
         addLog(.system, "Starting implementer session...")
         implementerSession = PTYSession(label: "implementer", workingDirectory: workingFolder, logger: diskLogger)
         implementerSession?.onOutput = { [weak self] text in
@@ -171,21 +157,16 @@ class AppState {
         }
         implementerSession?.spawn()
 
-        // Send the initial prompt to the thinker after a delay (let CC boot)
-        addLog(.system, "Waiting for sessions to initialize...")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
-            guard let self, self.runState == .running else { return }
-            self.sendInitialPrompt(task: task)
-        }
+        // Send initial prompt to thinker (-p mode, no PTY needed)
+        addLog(.system, "Sending task to thinker...")
+        sendThinkerPrompt(buildInitialPrompt(task: task))
     }
 
     func stop() {
         runState = .idle
         runTimer?.invalidate()
         runTimer = nil
-        thinkerSession?.terminate()
         implementerSession?.terminate()
-        thinkerSession = nil
         implementerSession = nil
         addLog(.system, "Stopped")
     }
@@ -199,11 +180,12 @@ class AppState {
     func resume() {
         guard runState == .paused || runState == .blocked else { return }
         if runState == .blocked, !blockedAnswer.isEmpty {
-            // Feed the answer back to the thinker
-            addLog(.system, "Answering blocked question: \(blockedAnswer)")
-            thinkerSession?.write(blockedAnswer + "\n")
+            // Feed the answer back to the thinker via -p mode
+            let answer = blockedAnswer
+            addLog(.system, "Answering blocked question: \(answer)")
             blockedQuestion = nil
             blockedAnswer = ""
+            sendThinkerPrompt("The user answered the blocked question: \(answer)\n\nContinue with the plan. Output the next <<<IMPL_PROMPT>>>...<<<END_IMPL_PROMPT>>> block or ALL_COMPLETE.")
         }
         runState = .running
         addLog(.system, "Resumed")
@@ -233,12 +215,7 @@ class AppState {
 
     // MARK: - Orchestration
 
-    func sendInitialPrompt(task: String) {
-        // Build markers dynamically so the literal string never appears in the prompt text
-        // (which CC echoes back and our parser would match)
-        let startMarker = "<<<" + "IMPL_PROMPT" + ">>>"
-        let endMarker = "<<<" + "END_IMPL_PROMPT" + ">>>"
-
+    func buildInitialPrompt(task: String) -> String {
         var prompt = """
         You are the THINKER in a two-agent system called readycode. Your job is to plan and coordinate long-running work on a codebase.
 
@@ -249,18 +226,18 @@ class AppState {
         TODO: 2. Second step description
 
         2. Then output the first implementation prompt between these exact markers (on their own lines):
-        \(startMarker)
+        <<<IMPL_PROMPT>>>
         (your detailed prompt for the implementer goes here)
-        \(endMarker)
+        <<<END_IMPL_PROMPT>>>
 
         3. When you receive results back from the implementer, respond with:
         - DONE: [n] to mark todo item n as complete
-        - Another \(startMarker)...\(endMarker) block for the next task
+        - Another <<<IMPL_PROMPT>>>...<<<END_IMPL_PROMPT>>> block for the next task
         - BLOCKED: [question] if you need human input
         - ALL_COMPLETE when everything is done
 
         RULES:
-        - The implementer is a separate Claude Code session. It can read files, write files, run commands.
+        - The implementer is a separate Claude Code session pointed at \(workingFolder). It can read files, write files, run commands.
         - Give the implementer clear, specific, self-contained prompts. It has no memory of previous prompts.
         - Do NOT write code yourself. Just tell the implementer what to do.
 
@@ -271,106 +248,94 @@ class AppState {
         if !additionalInstructions.isEmpty {
             prompt += "\n\nADDITIONAL INSTRUCTIONS:\n\(additionalInstructions)"
         }
+        return prompt
+    }
 
-        addLog(.thinker, "Sending initial prompt with task")
-        thinkerResponding = false
-        thinkerEchoDone = false
-        thinkerChunkCount = 0
-        thinkerResponseBuffer = ""
-        thinkerSession?.write(prompt + "\n")
-        // CC's TUI needs a separate Enter to submit after a paste
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            self?.thinkerSession?.write("\r")
+    // MARK: - Thinker (-p mode)
+
+    func sendThinkerPrompt(_ prompt: String) {
+        guard runState == .running else { return }
+        guard !thinkerBusy else {
+            addLog(.system, "Thinker busy, skipping")
+            return
         }
-    }
+        thinkerBusy = true
+        addLog(.thinker, "Sending prompt (\(prompt.count) chars)")
+        diskLogger?.log(source: "thinker-input", text: prompt)
 
-    func stripAnsi(_ text: String) -> String {
-        let esc = "\u{1B}"
-        return text.replacingOccurrences(of: "\(esc)\\[[0-9;]*[a-zA-Z]", with: "", options: .regularExpression)
-            .replacingOccurrences(of: "\(esc)\\].*?\u{07}", with: "", options: .regularExpression)
-            .replacingOccurrences(of: "\(esc)[^\\[\\]]", with: "", options: .regularExpression)
-            .replacingOccurrences(of: "\u{07}", with: "")
-    }
+        // Find claude binary
+        let possiblePaths = [
+            "/usr/local/bin/claude",
+            "/opt/homebrew/bin/claude",
+            NSString(string: "~/.claude/bin/claude").expandingTildeInPath
+        ]
+        guard let claudePath = possiblePaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
+            addLog(.system, "ERROR: claude binary not found")
+            thinkerBusy = false
+            return
+        }
 
-    func handleThinkerOutput(_ text: String) {
-        DispatchQueue.main.async { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
 
-            // Log raw output
-            self.diskLogger?.log(source: "thinker", text: text)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: claudePath)
+            process.arguments = ["-p", "--dangerously-skip-permissions", "--output-format", "json", prompt]
+            process.currentDirectoryURL = URL(fileURLWithPath: self.workingFolder)
 
-            // Feed raw output to xterm.js terminal
-            self.thinkerTerminalCoordinator.writeToTerminal(text)
+            // Clear nesting detection
+            var env = ProcessInfo.processInfo.environment
+            env.removeValue(forKey: "CLAUDECODE")
+            env.removeValue(forKey: "CLAUDE_CODE_SESSION")
+            process.environment = env
 
-            let stripped = self.stripAnsi(text)
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            process.standardOutput = outPipe
+            process.standardError = errPipe
 
-            // Phase 1: Wait for spinner (thinker has started processing)
-            let spinnerChars: Set<Character> = ["✻", "✳", "✶", "✢", "✽", "·"]
-            if !self.thinkerResponding {
-                for ch in stripped {
-                    if spinnerChars.contains(ch) {
-                        self.thinkerResponding = true
-                        self.thinkerChunkCount = 0
-                        self.thinkerResponseBuffer = ""
-                        self.addLog(.system, "Thinker is responding...")
-                        break
-                    }
+            do {
+                try process.run()
+                process.waitUntilExit()
+            } catch {
+                DispatchQueue.main.async {
+                    self.addLog(.system, "Thinker process error: \(error.localizedDescription)")
+                    self.thinkerBusy = false
                 }
                 return
             }
 
-            // Phase 2: After spinner detected, the echo content still arrives
-            // for several more chunks. Wait until we see the ⏺ character
-            // (CC uses this to mark the start of its actual response) before parsing.
-            // Also skip chunks that contain our instruction markers (echo tail).
-            self.thinkerChunkCount += 1
+            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: outData, encoding: .utf8) ?? ""
+            let errOutput = String(data: errData, encoding: .utf8) ?? ""
 
-            // Skip chunks that still contain echo content (our instruction text)
-            if stripped.contains("(your detailed prompt for the implementer goes here)") ||
-               stripped.contains("RULES:") ||
-               stripped.contains("THE TASK:") ||
-               stripped.contains("First step description") ||
-               stripped.contains("Second step description") {
-                return
-            }
-
-            // Only start accumulating after we see the response marker ⏺
-            // or after enough chunks have passed (the spinners)
-            if !self.thinkerEchoDone {
-                if stripped.contains("⏺") {
-                    self.thinkerEchoDone = true
-                    self.addLog(.system, "Thinker response started")
-                } else if self.thinkerChunkCount < 50 {
-                    // Still in spinner territory, not accumulating yet
-                    return
-                } else {
-                    // Fallback: after 50 chunks, assume echo is done
-                    self.thinkerEchoDone = true
+            DispatchQueue.main.async {
+                self.thinkerBusy = false
+                self.diskLogger?.log(source: "thinker-output", text: output)
+                if !errOutput.isEmpty {
+                    self.diskLogger?.log(source: "thinker-stderr", text: errOutput)
                 }
-            }
 
-            // Phase 3: Accumulate actual response text
-            self.thinkerResponseBuffer += stripped
-            if self.thinkerResponseBuffer.count > 100_000 {
-                self.thinkerResponseBuffer = String(self.thinkerResponseBuffer.suffix(80_000))
-            }
+                // Feed to terminal webview for display
+                self.thinkerTerminalCoordinator.writeToTerminal(output + "\n")
 
-            // Parse the accumulated buffer for markers
-            self.parseThinkerBuffer()
+                // Parse the JSON response to get the result text
+                var resultText = output
+                if let data = output.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let result = json["result"] as? String {
+                    resultText = result
+                }
 
-            // Add summarized entry to visible log
-            let summary = self.summarizeOutput(text, maxLength: 200)
-            if !summary.isEmpty {
-                self.addLog(.thinker, summary)
+                self.addLog(.thinker, String(resultText.prefix(200)))
+                self.parseThinkerResponse(resultText)
             }
         }
     }
 
-    func parseThinkerBuffer() {
-        let buf = thinkerResponseBuffer
-
-        // Parse TODO items
-        let lines = buf.components(separatedBy: "\n")
+    func parseThinkerResponse(_ text: String) {
+        let lines = text.components(separatedBy: "\n")
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -411,12 +376,12 @@ class AppState {
             }
         }
 
-        // Check for implementation prompt in the buffer
-        if buf.contains("<<<IMPL_PROMPT>>>") && buf.contains("<<<END_IMPL_PROMPT>>>") {
-            if let range = buf.range(of: "<<<IMPL_PROMPT>>>"),
-               let endRange = buf.range(of: "<<<END_IMPL_PROMPT>>>"),
+        // Extract implementation prompt
+        if text.contains("<<<IMPL_PROMPT>>>") && text.contains("<<<END_IMPL_PROMPT>>>") {
+            if let range = text.range(of: "<<<IMPL_PROMPT>>>"),
+               let endRange = text.range(of: "<<<END_IMPL_PROMPT>>>"),
                range.upperBound < endRange.lowerBound {
-                let prompt = String(buf[range.upperBound..<endRange.lowerBound])
+                let prompt = String(text[range.upperBound..<endRange.lowerBound])
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !prompt.isEmpty && self.runState == .running {
                     self.addLog(.system, "Sending to implementer (\(prompt.count) chars): \(String(prompt.prefix(100)))...")
@@ -426,11 +391,17 @@ class AppState {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                         self?.implementerSession?.write("\r")
                     }
-                    // Clear buffer up to end marker so we don't re-send
-                    self.thinkerResponseBuffer = String(buf[endRange.upperBound...])
                 }
             }
         }
+    }
+
+    func stripAnsi(_ text: String) -> String {
+        let esc = "\u{1B}"
+        return text.replacingOccurrences(of: "\(esc)\\[[0-9;]*[a-zA-Z]", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\(esc)\\].*?\u{07}", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\(esc)[^\\[\\]]", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\u{07}", with: "")
     }
 
     func handleImplementerOutput(_ text: String) {
@@ -497,15 +468,8 @@ class AppState {
                     - Or output ALL_COMPLETE if everything is done.
                     """
 
-                    self.thinkerResponding = false
-                    self.thinkerEchoDone = false
-                    self.thinkerChunkCount = 0
-                    self.thinkerResponseBuffer = ""
-                    self.thinkerSession?.write(feedback + "\n")
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                        self?.thinkerSession?.write("\r")
-                    }
                     self.implementerOutputBuffer = ""
+                    self.sendThinkerPrompt(feedback)
                 }
             }
 
