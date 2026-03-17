@@ -93,8 +93,10 @@ class AppState {
     var blockedAnswer: String = ""
 
     // Orchestration state
+    var thinkerEchoDone = false          // true once the echo + prompt display is fully done
     var thinkerResponding = false       // true once thinker starts its first spinner (past echo)
     var thinkerResponseBuffer = ""      // accumulates ONLY thinker response chunks (post-spinner)
+    var thinkerChunkCount = 0           // count chunks after spinner to skip echo tail
     var implementerResponding = false   // true once implementer starts working
     var implementerOutputBuffer = ""    // accumulates implementer response text
     var lastImplementerActivity = Date()  // for idle detection
@@ -232,6 +234,11 @@ class AppState {
     // MARK: - Orchestration
 
     func sendInitialPrompt(task: String) {
+        // Build markers dynamically so the literal string never appears in the prompt text
+        // (which CC echoes back and our parser would match)
+        let startMarker = "<<<" + "IMPL_PROMPT" + ">>>"
+        let endMarker = "<<<" + "END_IMPL_PROMPT" + ">>>"
+
         var prompt = """
         You are the THINKER in a two-agent system called readycode. Your job is to plan and coordinate long-running work on a codebase.
 
@@ -242,13 +249,13 @@ class AppState {
         TODO: 2. Second step description
 
         2. Then output the first implementation prompt between these exact markers (on their own lines):
-        <<<IMPL_PROMPT>>>
+        \(startMarker)
         (your detailed prompt for the implementer goes here)
-        <<<END_IMPL_PROMPT>>>
+        \(endMarker)
 
         3. When you receive results back from the implementer, respond with:
         - DONE: [n] to mark todo item n as complete
-        - Another <<<IMPL_PROMPT>>>...<<<END_IMPL_PROMPT>>> block for the next task
+        - Another \(startMarker)...\(endMarker) block for the next task
         - BLOCKED: [question] if you need human input
         - ALL_COMPLETE when everything is done
 
@@ -267,6 +274,9 @@ class AppState {
 
         addLog(.thinker, "Sending initial prompt with task")
         thinkerResponding = false
+        thinkerEchoDone = false
+        thinkerChunkCount = 0
+        thinkerResponseBuffer = ""
         thinkerSession?.write(prompt + "\n")
         // CC's TUI needs a separate Enter to submit after a paste
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
@@ -294,27 +304,53 @@ class AppState {
 
             let stripped = self.stripAnsi(text)
 
-            // Detect when thinker starts responding (spinner = past the echo)
-            // IMPORTANT: when we first see the spinner, skip this entire chunk
-            // because it contains the echoed prompt mixed with the spinner start.
-            // Only start parsing from the NEXT chunk.
+            // Phase 1: Wait for spinner (thinker has started processing)
             let spinnerChars: Set<Character> = ["✻", "✳", "✶", "✢", "✽", "·"]
             if !self.thinkerResponding {
                 for ch in stripped {
                     if spinnerChars.contains(ch) {
                         self.thinkerResponding = true
+                        self.thinkerChunkCount = 0
                         self.thinkerResponseBuffer = ""
                         self.addLog(.system, "Thinker is responding...")
                         break
                     }
                 }
-                // Skip this chunk entirely — it has the echo
                 return
             }
 
-            // Accumulate response text (only chunks AFTER the echo)
+            // Phase 2: After spinner detected, the echo content still arrives
+            // for several more chunks. Wait until we see the ⏺ character
+            // (CC uses this to mark the start of its actual response) before parsing.
+            // Also skip chunks that contain our instruction markers (echo tail).
+            self.thinkerChunkCount += 1
+
+            // Skip chunks that still contain echo content (our instruction text)
+            if stripped.contains("(your detailed prompt for the implementer goes here)") ||
+               stripped.contains("RULES:") ||
+               stripped.contains("THE TASK:") ||
+               stripped.contains("First step description") ||
+               stripped.contains("Second step description") {
+                return
+            }
+
+            // Only start accumulating after we see the response marker ⏺
+            // or after enough chunks have passed (the spinners)
+            if !self.thinkerEchoDone {
+                if stripped.contains("⏺") {
+                    self.thinkerEchoDone = true
+                    self.addLog(.system, "Thinker response started")
+                } else if self.thinkerChunkCount < 50 {
+                    // Still in spinner territory, not accumulating yet
+                    return
+                } else {
+                    // Fallback: after 50 chunks, assume echo is done
+                    self.thinkerEchoDone = true
+                }
+            }
+
+            // Phase 3: Accumulate actual response text
             self.thinkerResponseBuffer += stripped
-            // Cap buffer
             if self.thinkerResponseBuffer.count > 100_000 {
                 self.thinkerResponseBuffer = String(self.thinkerResponseBuffer.suffix(80_000))
             }
@@ -461,7 +497,10 @@ class AppState {
                     - Or output ALL_COMPLETE if everything is done.
                     """
 
-                    self.thinkerResponding = false  // reset so we skip the echo again
+                    self.thinkerResponding = false
+                    self.thinkerEchoDone = false
+                    self.thinkerChunkCount = 0
+                    self.thinkerResponseBuffer = ""
                     self.thinkerSession?.write(feedback + "\n")
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                         self?.thinkerSession?.write("\r")
